@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>HyperRift — Local textures, larger (nearest-neighbor)</title>
+  <style>
+    html,body { height:100%; margin:0; background:#000; -webkit-font-smoothing:none; -moz-osx-font-smoothing:grayscale; }
+    #screen { display:block; width:100%; height:100%; background:#000; touch-action:none; -webkit-user-select:none; user-select:none; }
+    #loading { position:absolute; left:12px; top:12px; color:#0ff; background:rgba(0,0,0,0.6); padding:6px 10px; border-radius:6px; font-size:13px; font-weight:600; pointer-events:none; }
+  </style>
+</head>
+<body>
+  <canvas id="screen"></canvas>
+  <div id="loading">Loading assets...</div>
+
+<script>
+/* Configuration & constants */
+const GAME_W = 1200;
+const GAME_H = 800;
+const SCREEN_WM = GAME_W / 2;
+const SCREEN_HM = GAME_H / 2;
+const PLAYER_W = 16 * 2;
+const PLAYER_H = 22 * 2;
+const GRAVITY = 0.7;
+const ACCELERATION = 1.5;
+const FRICTION = 0.91;
+
+/* Zoom multiplier to make the game larger on screen */
+const ZOOM_MULTIPLIER = 1.4;
+
+/* Canvas setup */
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d', { alpha: false });
+const buffer = document.createElement('canvas');
+buffer.width = GAME_W;
+buffer.height = GAME_H;
+const g = buffer.getContext('2d', { alpha: false });
+
+function disableSmoothing(c) {
+  if (!c) return;
+  c.imageSmoothingEnabled = false;
+  c.mozImageSmoothingEnabled = false;
+  c.webkitImageSmoothingEnabled = false;
+  c.msImageSmoothingEnabled = false;
+}
+disableSmoothing(ctx);
+disableSmoothing(g);
+
+let effectiveScale = 1, offsetX = 0, offsetY = 0;
+function resize() {
+  canvas.width = Math.max(300, window.innerWidth | 0);
+  canvas.height = Math.max(200, window.innerHeight | 0);
+  const baseScale = Math.min(canvas.width / GAME_W, canvas.height / GAME_H);
+  effectiveScale = Math.min(baseScale * ZOOM_MULTIPLIER, canvas.width / GAME_W, canvas.height / GAME_H);
+  effectiveScale = Math.max(0.1, effectiveScale);
+  offsetX = Math.round((canvas.width - GAME_W * effectiveScale) / 2);
+  offsetY = Math.round((canvas.height - GAME_H * effectiveScale) / 2);
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* Asset list — now all images expected in same folder as the HTML file (no subfolders) */
+const assetPaths = {
+  player_idle:      "idle.png",
+  player_run_1:     "run_1.png",
+  player_run_2:     "run_2.png",
+  player_run_3:     "run_3.png",
+  player_run_4:     "run_4.png",
+  player_run_5:     "run_5.png",
+  player_slide:     "slide.png",
+  grappling_gun:    "grappling_gun.png",
+  pistol_tex:       "pistol.png",
+  ground:           "ground.png",
+  grappling_point:  "grappling_point.png",
+  jump_pad:         "jump_pad.png"
+};
+
+const images = {};
+let assetsToLoad = 0, assetsLoaded = 0;
+const loadingEl = document.getElementById('loading');
+
+function loadAssets(cb) {
+  assetsToLoad = Object.keys(assetPaths).length;
+  assetsLoaded = 0;
+  for (const [key, path] of Object.entries(assetPaths)) {
+    const img = new Image();
+    img.src = path;
+    img.onload = () => {
+      images[key] = img;
+      assetsLoaded++;
+      loadingEl.textContent = "Loading assets... (" + assetsLoaded + "/" + assetsToLoad + ")";
+      if (assetsLoaded === assetsToLoad) { loadingEl.style.display = 'none'; cb(); }
+    };
+    img.onerror = () => {
+      // placeholder so the game continues if a file is missing
+      const stub = document.createElement('canvas');
+      stub.width = 64; stub.height = 64;
+      const sg = stub.getContext('2d');
+      sg.fillStyle = '#ff00ff'; sg.fillRect(0,0,64,64);
+      sg.fillStyle = '#000'; sg.fillText('missing',4,12);
+      images[key] = stub;
+      assetsLoaded++;
+      loadingEl.textContent = "Loading assets... (" + assetsLoaded + "/" + assetsToLoad + ")";
+      if (assetsLoaded === assetsToLoad) { loadingEl.style.display = 'none'; cb(); }
+    };
+  }
+}
+
+/* Helpers */
+function rectIntersects(a,b){ return !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y); }
+function pointInRect(px,py,r){ return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h; }
+function drawImageRot(img,x,y,w,h,angleDeg=0,flip='none'){ const cx=x+w/2, cy=y+h/2; g.save(); g.translate(cx,cy); const rad=(angleDeg*Math.PI)/180; g.rotate(rad); if(flip==='horizontal') g.scale(-1,1); if(flip==='vertical') g.scale(1,-1); g.drawImage(img,-w/2,-h/2,w,h); g.restore(); }
+function drawImageFlipped(img,x,y,w,h,flip='none'){ g.save(); const cx=x+w/2, cy=y+h/2; g.translate(cx,cy); if(flip==='horizontal') g.scale(-1,1); if(flip==='vertical') g.scale(1,-1); g.drawImage(img,-w/2,-h/2,w,h); g.restore(); }
+
+/* Game state (mirrors C++ initial state) */
+const player = { normal:{x:0,y:700,w:PLAYER_W,h:PLAYER_H}, slide:{x:0,y:704,w:18*2,h:21*2}, x_velocity:0,y_velocity:0,falling:0,dir:1,running:false,sliding:false,gun:"none",run_frame:0 };
+const grappling_gun = { rect:{x:600,y:GAME_H-64,w:9*2,h:7*2}, init_x:0, init_y:0, init_dist:0, grapplerPos:{x:0,y:0}, x_velocity:0,y_velocity:0,angle:0,grappling:false };
+const pistol = { rect:{x:700,y:GAME_H-64,w:9*2,h:7*2}, x_velocity:0,y_velocity:0, angle:0 };
+const pistol_bullet = new Array(100).fill(null).map(()=>({ active:false, x:0,y:0,dx:0,dy:0, rect:{x:0,y:0,w:10,h:10} }));
+const level = [ { rect:{x:0,y:GAME_H-50,w:2000,h:200} }, { rect:{x:0,y:GAME_H-600,w:2000,h:200} } ];
+const grappling_points = [ { rect:{x:1000,y:GAME_H-430,w:60,h:60} } ];
+for (const gp of grappling_points) gp.hitbox = { x: gp.rect.x - (4*gp.rect.w), y: gp.rect.y - (4*gp.rect.h), w: gp.rect.w * 9, h: gp.rect.h * 9 };
+const jump_pads = [ { rect:{x:500,y:GAME_H-62,w:50,h:12} } ];
+
+/* Input */
+const keys = {}; let mouseIsDown = false; let cursorScreenX=0,cursorScreenY=0,cursorX=0,cursorY=0;
+window.addEventListener('keydown',(e)=>keys[e.code]=true); window.addEventListener('keyup',(e)=>keys[e.code]=false);
+function updateCursorFromEvent(evt){ const rect=canvas.getBoundingClientRect(); cursorScreenX = evt.clientX - rect.left; cursorScreenY = evt.clientY - rect.top; const gx = (cursorScreenX - offsetX) / Math.max(effectiveScale,1e-9); const gy = (cursorScreenY - offsetY) / Math.max(effectiveScale,1e-9); cursorX = gx; cursorY = gy; return {x:gx,y:gy}; }
+
+canvas.addEventListener('mousemove',(ev)=>updateCursorFromEvent(ev));
+canvas.addEventListener('mousedown',(ev)=>{ updateCursorFromEvent(ev); if(player.gun === "grapple"){ for(let i=0;i<grappling_points.length;i++){ if(mouseIsDown === false){ const gp = grappling_points[i]; if(pointInRect(cursorX,cursorY,gp.hitbox)){ grappling_gun.init_x = gp.rect.x + (gp.rect.w/2); grappling_gun.init_y = gp.rect.y + (gp.rect.h/2); grappling_gun.grapplerPos.x = grappling_gun.init_x; grappling_gun.grapplerPos.y = grappling_gun.init_y; let dx = grappling_gun.init_x - player.normal.x; let dy = grappling_gun.init_y - player.normal.y; grappling_gun.init_dist = Math.sqrt(dx*dx + dy*dy)/2; } else { grappling_gun.init_x = cursorX; grappling_gun.init_y = cursorX; grappling_gun.grapplerPos.x = grappling_gun.init_x; grappling_gun.grapplerPos.y = grappling_gun.init_y; let dx = grappling_gun.init_x - player.normal.x; let dy = grappling_gun.init_y - player.normal.y; grappling_gun.init_dist = Math.sqrt(dx*dx + dy*dy)/2; } } } } mouseIsDown=true; });
+canvas.addEventListener('mouseup',(ev)=>{ updateCursorFromEvent(ev); if(player.gun==="grapple"){ if(mouseIsDown===true && grappling_gun.grappling===true) player.x_velocity *= 2; } if(player.gun==="pistol"){ if(mouseIsDown===true){ let used=false; for(let i=0;i<pistol_bullet.length && !used;i++){ if(!pistol_bullet[i].active && !used){ pistol_bullet[i].active=true; pistol_bullet[i].x = pistol.rect.x; pistol_bullet[i].y = pistol.rect.y; pistol_bullet[i].rect.x = pistol.rect.x; pistol_bullet[i].rect.y = pistol.rect.y; pistol.rect.x = SCREEN_WM - 8; pistol.rect.y = SCREEN_HM; let dx = cursorX - pistol.rect.x; let dy = cursorY - pistol.rect.y; let dist = Math.sqrt(dx*dx + dy*dy); if(dist>0){ dx/=dist; dy/=dist; } pistol_bullet[i].dx = dx; pistol_bullet[i].dy = dy; used=true; } } } } mouseIsDown=false; });
+canvas.addEventListener('touchstart',(ev)=>{ ev.preventDefault(); const t=ev.touches[0]; updateCursorFromEvent({clientX:t.clientX, clientY:t.clientY}); if(player.gun === "grapple"){ for(let i=0;i<grappling_points.length;i++){ if(mouseIsDown===false){ const gp=grappling_points[i]; if(pointInRect(cursorX,cursorY,gp.hitbox)){ grappling_gun.init_x = gp.rect.x + (gp.rect.w/2); grappling_gun.init_y = gp.rect.y + (gp.rect.h/2); grappling_gun.grapplerPos.x = grappling_gun.init_x; grappling_gun.grapplerPos.y = grappling_gun.init_y; let dx = grappling_gun.init_x - player.normal.x; let dy = grappling_gun.init_y - player.normal.y; grappling_gun.init_dist = Math.sqrt(dx*dx + dy*dy)/2; } else { grappling_gun.init_x = cursorX; grappling_gun.init_y = cursorX; grappling_gun.grapplerPos.x = grappling_gun.init_x; grappling_gun.grapplerPos.y = grappling_gun.init_y; let dx = grappling_gun.init_x - player.normal.x; let dy = grappling_gun.init_y - player.normal.y; grappling_gun.init_dist = Math.sqrt(dx*dx + dy*dy)/2; } } } } mouseIsDown=true; });
+canvas.addEventListener('touchend',(ev)=>{ ev.preventDefault(); if(player.gun==="grapple"){ if(mouseIsDown===true && grappling_gun.grappling===true) player.x_velocity *= 2; } if(player.gun==="pistol"){ if(mouseIsDown===true){ let used=false; for(let i=0;i<pistol_bullet.length && !used;i++){ if(!pistol_bullet[i].active && !used){ pistol_bullet[i].active=true; pistol_bullet[i].x = pistol.rect.x; pistol_bullet[i].y = pistol.rect.y; pistol_bullet[i].rect.x = pistol.rect.x; pistol_bullet[i].rect.y = pistol.rect.y; pistol.rect.x = SCREEN_WM - 8; pistol.rect.y = SCREEN_HM; let dx = cursorX - pistol.rect.x; let dy = cursorY - pistol.rect.y; let dist = Math.sqrt(dx*dx + dy*dy); if(dist>0){ dx/=dist; dy/=dist; } pistol_bullet[i].dx = dx; pistol_bullet[i].dy = dy; used=true; } } } } mouseIsDown=false; });
+canvas.addEventListener('contextmenu',(e)=>e.preventDefault());
+
+/* Game loop and logic (identical behavior to previous version) */
+let lastTime = performance.now();
+function gameLoop(now){
+  const dt = now - lastTime; lastTime = now;
+
+  if (mouseIsDown === false || grappling_gun.grappling === false) {
+    if (!player.sliding) {
+      if (keys['KeyA']) { player.x_velocity -= ACCELERATION; player.dir = -1; }
+      if (keys['KeyD']) { player.x_velocity += ACCELERATION; player.dir = 1; }
+      if (keys['KeyW'] && player.falling <= 2) { player.y_velocity = -12; }
+      if (keys['KeyA'] || keys['KeyD']) { player.run_frame += 0.2; player.running = true; }
+    }
+    player.sliding = !!keys['KeyS'];
+    if (keys['KeyQ'] && player.gun === "grapple") { player.gun = "none"; const dx = cursorX - grappling_gun.rect.x; const dy = cursorY - grappling_gun.rect.y; grappling_gun.x_velocity = dx/6; grappling_gun.y_velocity = dy/6; }
+    if (keys['KeyQ'] && player.gun === "pistol") { player.gun = "none"; const dx = cursorX - pistol.rect.x; const dy = cursorY - pistol.rect.y; pistol.x_velocity = dx/6; pistol.y_velocity = dy/6; }
+    if (keys['KeyE']) {
+      if (pointInRect(cursorX,cursorY,grappling_gun.rect) && Math.abs(player.normal.x - grappling_gun.rect.x) < 500 && Math.abs(player.normal.y - grappling_gun.rect.y) < 500) player.gun = "grapple";
+      if (pointInRect(cursorX,cursorY,pistol.rect) && Math.abs(player.normal.x - pistol.rect.x) < 500 && Math.abs(player.normal.y - pistol.rect.y) < 500) player.gun = "pistol";
+    }
+  }
+
+  // --- Update objects ---
+  grappling_gun.grappling = false;
+  if (player.gun === "grapple") {
+    for (let i = 0; i < grappling_points.length; i++) {
+      const gp = grappling_points[i];
+      if (mouseIsDown && pointInRect(grappling_gun.grapplerPos.x, grappling_gun.grapplerPos.y, gp.hitbox)) {
+        grappling_gun.grappling = true;
+        let dx = grappling_gun.init_x - player.normal.x;
+        let dy = grappling_gun.init_y - player.normal.y;
+        let distance = Math.sqrt(dx*dx + dy*dy);
+        if (distance !== 0) { dx /= distance; dy /= distance; }
+        player.x_velocity += dx * 3;
+        if (distance < grappling_gun.init_dist) player.y_velocity -= dy;
+        else player.y_velocity += dy * 2;
+      }
+    }
+  } else {
+    if (Math.abs(grappling_gun.x_velocity) < 0.5) grappling_gun.x_velocity = 0;
+    grappling_gun.x_velocity *= 0.95;
+    grappling_gun.y_velocity += 1;
+    if (grappling_gun.x_velocity !== 0) {
+      const steps = Math.ceil(Math.abs(grappling_gun.x_velocity));
+      for (let i = 0; i < steps; i++) {
+        const lastX = grappling_gun.rect.x;
+        const sign = grappling_gun.x_velocity / Math.abs(grappling_gun.x_velocity);
+        grappling_gun.rect.x += sign;
+        let collided = false;
+        for (let j = 0; j < level.length; j++) if (rectIntersects(grappling_gun.rect, level[j].rect)) { collided = true; break; }
+        if (!collided) for (let j = 0; j < jump_pads.length; j++) if (rectIntersects(grappling_gun.rect, jump_pads[j].rect)) { collided = true; break; }
+        if (collided) { grappling_gun.rect.x = lastX; grappling_gun.x_velocity = 0; }
+      }
+    }
+    if (grappling_gun.y_velocity !== 0) {
+      const steps = Math.ceil(Math.abs(grappling_gun.y_velocity));
+      for (let i = 0; i < steps; i++) {
+        const lastY = grappling_gun.rect.y;
+        const sign = grappling_gun.y_velocity / Math.abs(grappling_gun.y_velocity);
+        grappling_gun.rect.y += sign;
+        let collided = false;
+        for (let j = 0; j < level.length; j++) if (rectIntersects(grappling_gun.rect, level[j].rect)) { collided = true; break; }
+        if (!collided) {
+          for (let j = 0; j < jump_pads.length; j++) {
+            if (rectIntersects(grappling_gun.rect, jump_pads[j].rect)) { collided = true; grappling_gun.y_velocity = -15; break; }
+          }
+        }
+        if (collided === true && grappling_gun.y_velocity !== -15) { grappling_gun.rect.y = lastY; grappling_gun.y_velocity = 0; }
+      }
+    }
+  }
+
+  if (player.gun !== "pistol") {
+    if (Math.abs(pistol.x_velocity) < 0.5) pistol.x_velocity = 0;
+    pistol.x_velocity *= 0.95;
+    pistol.y_velocity += 1;
+    if (pistol.x_velocity !== 0) {
+      const steps = Math.ceil(Math.abs(pistol.x_velocity));
+      for (let i = 0; i < steps; i++) {
+        const lastX = pistol.rect.x;
+        const sign = pistol.x_velocity / Math.abs(pistol.x_velocity);
+        pistol.rect.x += sign;
+        let collided = false;
+        for (let j = 0; j < level.length; j++) if (rectIntersects(pistol.rect, level[j].rect)) { collided = true; break; }
+        if (!collided) for (let j = 0; j < jump_pads.length; j++) if (rectIntersects(pistol.rect, jump_pads[j].rect)) { collided = true; break; }
+        if (collided) { pistol.rect.x = lastX; pistol.x_velocity = 0; }
+      }
+    }
+    if (pistol.y_velocity !== 0) {
+      const steps = Math.ceil(Math.abs(pistol.y_velocity));
+      for (let i = 0; i < steps; i++) {
+        const lastY = pistol.rect.y;
+        const sign = pistol.y_velocity / Math.abs(pistol.y_velocity);
+        pistol.rect.y += sign;
+        let collided = false;
+        for (let j = 0; j < level.length; j++) if (rectIntersects(pistol.rect, level[j].rect)) { collided = true; break; }
+        if (!collided) {
+          for (let j = 0; j < jump_pads.length; j++) {
+            if (rectIntersects(pistol.rect, jump_pads[j].rect)) { collided = true; pistol.y_velocity = -15; break; }
+          }
+        }
+        if (collided === true && pistol.y_velocity !== -15) { pistol.rect.y = lastY; pistol.y_velocity = 0; }
+      }
+    }
+  }
+
+  player.falling++;
+  player.y_velocity += GRAVITY;
+  if (!player.sliding) player.x_velocity *= FRICTION;
+  if (Math.abs(player.x_velocity) < 0.1) { player.x_velocity = 0; player.running = false; player.run_frame = 0; }
+  if (!(keys['KeyA'] || keys['KeyD']) && Math.abs(player.x_velocity) > 0) player.run_frame += 0.1;
+
+  if (player.x_velocity !== 0) {
+    const steps = Math.ceil(Math.abs(player.x_velocity));
+    for (let i = 0; i < steps; i++) {
+      const lastX = player.normal.x;
+      const sign = player.x_velocity / Math.abs(player.x_velocity);
+      player.normal.x += sign;
+      let collided = false;
+      for (let j = 0; j < level.length; j++) if (rectIntersects(player.normal, level[j].rect)) { collided = true; break; }
+      if (!collided) for (let j = 0; j < jump_pads.length; j++) if (rectIntersects(player.normal, jump_pads[j].rect)) { collided = true; break; }
+      if (collided) { player.normal.x = lastX; player.x_velocity = 0; }
+    }
+  }
+
+  if (player.y_velocity !== 0) {
+    const steps = Math.ceil(Math.abs(player.y_velocity));
+    for (let i = 0; i < steps; i++) {
+      const lastY = player.normal.y;
+      const sign = player.y_velocity / Math.abs(player.y_velocity);
+      player.normal.y += sign;
+      let collided = false;
+      for (let j = 0; j < level.length; j++) {
+        if (rectIntersects(player.normal, level[j].rect)) { collided = true; player.falling = 0; player.y_velocity = 0; break; }
+      }
+      if (!collided) {
+        for (let j = 0; j < jump_pads.length; j++) {
+          if (rectIntersects(player.normal, jump_pads[j].rect)) { collided = true; player.falling = 0; player.y_velocity = -15; break; }
+        }
+      }
+      if (collided === false) { } else { if (player.y_velocity === 0) player.normal.y = lastY; }
+    }
+  }
+
+  if (player.gun === "grapple") {
+    grappling_gun.rect.x = SCREEN_WM - 8; grappling_gun.rect.y = SCREEN_HM;
+    let dx = cursorX - grappling_gun.rect.x; let dy = cursorY - grappling_gun.rect.y; let dist = Math.sqrt(dx*dx + dy*dy);
+    if (dist>0){ dx/=dist; dy/=dist; } grappling_gun.rect.x += dx*30; grappling_gun.rect.y += dy*30;
+  }
+  if (player.gun === "pistol") {
+    pistol.rect.x = SCREEN_WM - 8; pistol.rect.y = SCREEN_HM;
+    let dx = cursorX - pistol.rect.x; let dy = cursorY - pistol.rect.y; let dist = Math.sqrt(dx*dx + dy*dy);
+    if (dist>0){ dx/=dist; dy/=dist; } pistol.rect.x += dx*30; pistol.rect.y += dy*30;
+    for (let i=0;i<pistol_bullet.length;i++) if (pistol_bullet[i].active) { pistol_bullet[i].x += pistol_bullet[i].dx * 10; pistol_bullet[i].y += pistol_bullet[i].dy * 10; pistol_bullet[i].rect.x = pistol_bullet[i].x; pistol_bullet[i].rect.y = pistol_bullet[i].y; }
+  }
+
+  const scrollX = player.normal.x - (SCREEN_WM - (PLAYER_W/2));
+  const scrollY = player.normal.y - (SCREEN_HM - (PLAYER_H/2));
+  player.normal.x = (SCREEN_WM - (PLAYER_W/2));
+  player.normal.y = (SCREEN_HM - (PLAYER_H/2));
+  grappling_gun.init_x -= scrollX; grappling_gun.init_y -= scrollY; grappling_gun.grapplerPos.x = grappling_gun.init_x; grappling_gun.grapplerPos.y = grappling_gun.init_y;
+  player.slide.x = player.normal.x; player.slide.y = player.normal.y + 4;
+  if (player.gun !== "grapple") { grappling_gun.rect.x -= scrollX; grappling_gun.rect.y -= scrollY; }
+  if (player.gun !== "pistol") { pistol.rect.x -= scrollX; pistol.rect.y -= scrollY; }
+  for (let i=0;i<level.length;i++){ level[i].rect.x -= scrollX; level[i].rect.y -= scrollY; }
+  for (let i=0;i<grappling_points.length;i++){ grappling_points[i].rect.x -= scrollX; grappling_points[i].rect.y -= scrollY; grappling_points[i].hitbox.x -= scrollX; grappling_points[i].hitbox.y -= scrollY; }
+  for (let i=0;i<jump_pads.length;i++){ jump_pads[i].rect.x -= scrollX; jump_pads[i].rect.y -= scrollY; }
+
+  // --- Rendering ---
+  g.fillStyle='rgb(0,0,255)'; g.fillRect(0,0,GAME_W,GAME_H);
+
+  function drawGrappleLine(p_dir){ if(!grappling_gun.grappling) return; const sx=grappling_gun.rect.x; const sy=grappling_gun.rect.y+5; const tx=grappling_gun.init_x; const ty=grappling_gun.init_y; g.lineWidth=1; function L(a,b,alpha){ g.strokeStyle=`rgba(83,185,255,${alpha})`; g.beginPath(); g.moveTo(sx+a,sy); g.lineTo(tx+b,ty); g.stroke(); } if(p_dir===1){ L(-1,-3,0.27); L(0,-2,0.39); L(1,-1,0.59); L(2,0,0.7); L(3,0,1.0); L(4,1,1.0); L(5,2,1.0); L(6,3,1.0); L(7,4,0.7); L(8,5,0.59); L(9,6,0.39); L(10,7,0.27); } else { L(6,-3,0.27); L(7,-2,0.39); L(8,-1,0.59); L(9,0,0.7); L(10,0,1.0); L(11,1,1.0); L(12,2,1.0); L(13,3,1.0); L(14,4,0.7); L(15,5,0.59); L(16,6,0.39); L(17,7,0.27); } }
+  drawGrappleLine(player.dir);
+
+  for (let i=0;i<grappling_points.length;i++){ const gp=grappling_points[i]; if(images.grappling_point) g.drawImage(images.grappling_point, gp.rect.x, gp.rect.y, gp.rect.w, gp.rect.h); else { g.fillStyle='#0ff'; g.fillRect(gp.rect.x,gp.rect.y,gp.rect.w,gp.rect.h); } }
+  for (let i=0;i<jump_pads.length;i++){ const jp=jump_pads[i]; if(images.jump_pad) g.drawImage(images.jump_pad, jp.rect.x, jp.rect.y, jp.rect.w, jp.rect.h); else { g.fillStyle='#ff0'; g.fillRect(jp.rect.x,jp.rect.y,jp.rect.w,jp.rect.h); } }
+  for (let i=0;i<level.length;i++){ if(images.ground) g.drawImage(images.ground, level[i].rect.x, level[i].rect.y, level[i].rect.w, level[i].rect.h); else { g.fillStyle='#550'; g.fillRect(level[i].rect.x, level[i].rect.y, level[i].rect.w, level[i].rect.h); } }
+
+  // Player drawing
+  if (!player.sliding) {
+    if (player.dir === 1) {
+      if (player.running) {
+        const temp = Math.abs(Math.floor(player.run_frame));
+        const frame = (temp % 5) + 1;
+        const img = images['player_run_'+frame] || images.player_idle;
+        g.drawImage(img, player.normal.x, player.normal.y, player.normal.w, player.normal.h);
+      } else {
+        const img = images.player_idle;
+        g.drawImage(img, player.normal.x, player.normal.y, player.normal.w, player.normal.h);
+      }
+    } else {
+      if (player.running) {
+        const temp = Math.abs(Math.floor(player.run_frame));
+        const frame = (temp % 5) + 1;
+        const img = images['player_run_'+frame] || images.player_idle;
+        drawImageFlipped(img, player.normal.x, player.normal.y, player.normal.w, player.normal.h, 'horizontal');
+      } else {
+        const img = images.player_idle;
+        drawImageFlipped(img, player.normal.x, player.normal.y, player.normal.w, player.normal.h, 'horizontal');
+      }
+    }
+  } else {
+    if (player.dir === 1) {
+      const img = images.player_slide;
+      g.drawImage(img, player.slide.x, player.slide.y, player.slide.w, player.slide.h);
+    } else {
+      const img = images.player_slide;
+      drawImageFlipped(img, player.slide.x, player.slide.y, player.slide.w, player.slide.h, 'horizontal');
+    }
+  }
+
+  // Grappling gun draw
+  if (player.gun === "grapple") {
+    if (player.dir === 1) {
+      if (grappling_gun.grappling === true) {
+        const centerX = grappling_gun.rect.x + grappling_gun.rect.w/2;
+        const centerY = grappling_gun.rect.y + grappling_gun.rect.h/2;
+        const dx = grappling_gun.init_x - centerX;
+        const dy = grappling_gun.init_y - centerY;
+        const angle = Math.atan2(dy,dx)*(180/Math.PI);
+        grappling_gun.angle = angle;
+        drawImageRot(images.grappling_gun, grappling_gun.rect.x, grappling_gun.rect.y, grappling_gun.rect.w, grappling_gun.rect.h, grappling_gun.angle, 'none');
+      } else {
+        const centerX = grappling_gun.rect.x + grappling_gun.rect.w/2;
+        const centerY = grappling_gun.rect.y + grappling_gun.rect.h/2;
+        const dx = cursorX - centerX;
+        const dy = cursorY - centerY;
+        const angle = Math.atan2(dy,dx)*(180/Math.PI);
+        if (Math.abs(grappling_gun.angle - angle) < 160) {
+          if (grappling_gun.angle > angle) grappling_gun.angle -= (grappling_gun.angle - angle)/6;
+          else grappling_gun.angle += (angle - grappling_gun.angle)/6;
+        } else grappling_gun.angle = angle;
+        drawImageRot(images.grappling_gun, grappling_gun.rect.x, grappling_gun.rect.y, grappling_gun.rect.w, grappling_gun.rect.h, grappling_gun.angle, 'none');
+      }
+    } else {
+      if (grappling_gun.grappling === true) {
+        const centerX = grappling_gun.rect.x + grappling_gun.rect.w/2;
+        const centerY = grappling_gun.rect.y + grappling_gun.rect.h/2;
+        const dx = grappling_gun.init_x - centerX;
+        const dy = grappling_gun.init_y - centerY;
+        const angle = Math.atan2(dy,dx)*(180/Math.PI);
+        grappling_gun.angle = angle;
+        drawImageRot(images.grappling_gun, grappling_gun.rect.x, grappling_gun.rect.y, grappling_gun.rect.w, grappling_gun.rect.h, grappling_gun.angle, 'vertical');
+      } else {
+        const centerX = grappling_gun.rect.x + grappling_gun.rect.w/2;
+        const centerY = grappling_gun.rect.y + grappling_gun.rect.h/2;
+        const dx = cursorX - centerX;
+        const dy = cursorY - centerY;
+        const angle = Math.atan2(dy,dx)*(180/Math.PI);
+        if (Math.abs(grappling_gun.angle - angle) < 160) {
+          if (grappling_gun.angle > angle) grappling_gun.angle -= (grappling_gun.angle - angle)/6;
+          else grappling_gun.angle += (angle - grappling_gun.angle)/6;
+        } else grappling_gun.angle = angle;
+        drawImageRot(images.grappling_gun, grappling_gun.rect.x, grappling_gun.rect.y, grappling_gun.rect.w, grappling_gun.rect.h, grappling_gun.angle, 'vertical');
+      }
+    }
+  } else {
+    g.drawImage(images.grappling_gun, grappling_gun.rect.x, grappling_gun.rect.y, grappling_gun.rect.w, grappling_gun.rect.h);
+  }
+
+  // Pistol draw
+  if (player.gun === "pistol") {
+    if (player.dir === 1) {
+      const centerX = pistol.rect.x + pistol.rect.w/2;
+      const centerY = pistol.rect.y + pistol.rect.h/2;
+      let dx = cursorX - centerX;
+      let dy = cursorY - centerY;
+      let angle = Math.atan2(dy,dx)*(180/Math.PI);
+      if (Math.abs(pistol.angle - angle) < 160) { if (pistol.angle > angle) pistol.angle -= (pistol.angle - angle)/6; else pistol.angle += (angle - pistol.angle)/6; } else pistol.angle = angle;
+      drawImageRot(images.pistol_tex, pistol.rect.x, pistol.rect.y, pistol.rect.w, pistol.rect.h, pistol.angle, 'none');
+    } else {
+      const centerX = pistol.rect.x + pistol.rect.w/2;
+      const centerY = pistol.rect.y + pistol.rect.h/2;
+      let dx = cursorX - centerX;
+      let dy = cursorY - centerY;
+      let angle = Math.atan2(dy,dx)*(180/Math.PI);
+      if (Math.abs(pistol.angle - angle) < 160) { if (pistol.angle > angle) pistol.angle -= (pistol.angle - angle)/6; else pistol.angle += (angle - pistol.angle)/6; } else pistol.angle = angle;
+      drawImageRot(images.pistol_tex, pistol.rect.x, pistol.rect.y, pistol.rect.w, pistol.rect.h, pistol.angle, 'vertical');
+    }
+  } else {
+    g.drawImage(images.pistol_tex, pistol.rect.x, pistol.rect.y, pistol.rect.w, pistol.rect.h);
+  }
+
+  for (let i=0;i<pistol_bullet.length;i++) if (pistol_bullet[i].active) { const b=pistol_bullet[i].rect; g.drawImage(images.pistol_tex, b.x, b.y, b.w, b.h); }
+
+  // Present buffer to visible canvas — clear with black then draw scaled buffer
+  ctx.fillStyle = '#000'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  disableSmoothing(ctx);
+  const destW = Math.round(GAME_W * effectiveScale);
+  const destH = Math.round(GAME_H * effectiveScale);
+  const destX = Math.round(offsetX);
+  const destY = Math.round(offsetY);
+  ctx.drawImage(buffer, 0,0,GAME_W,GAME_H, destX, destY, destW, destH);
+
+  window.requestAnimationFrame(gameLoop);
+}
+
+/* Start */
+loadAssets(()=>{ images.player_run_1 = images.player_run_1 || images.player_idle; images.player_run_2 = images.player_run_2 || images.player_idle; images.player_run_3 = images.player_run_3 || images.player_idle; images.player_run_4 = images.player_run_4 || images.player_idle; images.player_run_5 = images.player_run_5 || images.player_idle; lastTime = performance.now(); window.requestAnimationFrame(gameLoop); });
+
+</script>
+</body>
+</html>
